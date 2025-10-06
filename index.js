@@ -56,7 +56,8 @@ const ANALYSIS_PROMPT = `Act as a senior design consultant for \"Minimind Agency
 // --- 2. DYNAMIC AI ANALYSIS FUNCTION ---
 function createApiRequest(provider, apiKey, promptContent, type = 'analyze') {
     let prompt, response_format, model;
-    if (type === 'analyze' || type === 'proposal') {
+    if (type === 'analyze') {
+        prompt = ANALYSIS_PROMPT + ` Here is the HTML content for page ${promptContent.pageName}: --- ${promptContent.content.substring(0, 30000)} ---`;
         response_format = { "type": "json_object" };
     } else {
         prompt = promptContent;
