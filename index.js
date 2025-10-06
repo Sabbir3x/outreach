@@ -139,7 +139,7 @@ app.post('/analyze', async (req, res) => {
         console.log(`Using AI Provider: ${provider} for analysis`);
         const analysisResult = await createApiRequest(provider, apiKey, { content: htmlContent, pageName: pageName }, 'analyze');
         
-        res.status(200).json(analysisResult);
+        res.status(200).json({ ...analysisResult, metadata });
 
     } catch (error) {
         console.error("Error in /analyze endpoint:", error.message);
