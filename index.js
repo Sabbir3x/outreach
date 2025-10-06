@@ -3,7 +3,12 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const https = require('https');
+const { createClient } = require('@supabase/supabase-js');
 const cheerio = require('cheerio');
+
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -157,6 +162,92 @@ app.post('/chat', async (req, res) => {
 
     } catch (error) {
         console.error("Error in /chat endpoint:", error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+const PROPOSAL_PROMPT_TEMPLATE = `
+Act as a friendly and professional design consultant from "Minimind Agency". Your goal is to write a personalized and compelling outreach message based on an analysis of a potential client's Facebook page.
+
+**Analysis Details:**
+- Page Name: {pageName}
+- Overall Design Score: {overall_score}/100
+- Key Issues Found: {issues}
+- AI Rationale: {rationale}
+
+**Your Task:**
+Generate two versions of an outreach message: a short, friendly Facebook message and a slightly more detailed professional email. The tone should be helpful, not spammy. Reference one or two key issues from the analysis as a conversation starter.
+
+**Output Format:**
+You MUST return ONLY a single, minified JSON object with the following structure: {"facebook_message": "<Your generated Facebook message>", "email_subject": "<Your generated email subject>", "email_body": "<Your generated email body>"}
+
+**Example Snippets (for tone and style):
+- Facebook: "Hi {pageName}, I checked your page and noticed some design inconsistencies that might be affecting engagement. I can share a free concept for you to review — no obligations. Interested?"
+- Email Subject: "Design refresh proposal for {pageName}"
+- Email Body: "Hello, I’m from Minimind Agency. We reviewed your Facebook page and see opportunities to improve clarity through consistent branding..."
+
+Now, generate the JSON for the page mentioned above.
+`;
+
+app.post('/create-proposal', async (req, res) => {
+    const { analysisId, userId } = req.body;
+    if (!analysisId || !userId) return res.status(400).json({ error: 'analysisId and userId are required.' });
+
+    try {
+        // 1. Fetch analysis and page data from Supabase
+        const { data: analysis, error: analysisError } = await supabase
+            .from('analyses')
+            .select(`
+                *,
+                pages (*)
+            `)
+            .eq('id', analysisId)
+            .single();
+
+        if (analysisError) throw new Error(`Failed to fetch analysis: ${analysisError.message}`);
+        if (!analysis) return res.status(404).json({ error: 'Analysis not found.' });
+
+        const page = analysis.pages;
+
+        // 2. Construct the prompt for the AI
+        let prompt = PROPOSAL_PROMPT_TEMPLATE
+            .replace('{pageName}', page.name)
+            .replace('{overall_score}', analysis.overall_score)
+            .replace('{issues}', JSON.stringify(analysis.issues.map(i => i.description)))
+            .replace('{rationale}', analysis.rationale);
+
+        // 3. Call the AI to generate the proposal
+        const provider = process.env.API_PROVIDER?.toLowerCase();
+        const apiKey = process.env[`${provider.toUpperCase()}_API_KEY`];
+        const aiResultRaw = await createApiRequest(provider, apiKey, prompt, 'proposal');
+        
+        // Ensure the result is a valid JSON object
+        const jsonMatch = aiResultRaw.match(/\{.*\}/s);
+        if (!jsonMatch) throw new Error("AI returned non-JSON response for proposal.");
+        const proposalContent = JSON.parse(jsonMatch[0]);
+
+        // 4. Save the new draft to the database
+        const { data: newDraft, error: draftError } = await supabase
+            .from('drafts')
+            .insert({
+                page_id: page.id,
+                analysis_id: analysis.id,
+                created_by: userId,
+                fb_message: proposalContent.facebook_message,
+                email_subject: proposalContent.email_subject,
+                email_body: proposalContent.email_body,
+                status: 'pending'
+            })
+            .select()
+            .single();
+
+        if (draftError) throw new Error(`Failed to save draft: ${draftError.message}`);
+
+        // 5. Return the newly created draft
+        res.status(201).json(newDraft);
+
+    } catch (error) {
+        console.error("Error in /create-proposal endpoint:", error.message);
         res.status(500).json({ error: error.message });
     }
 });
