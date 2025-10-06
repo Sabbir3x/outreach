@@ -75,7 +75,16 @@ function createApiRequest(provider, apiKey, promptContent, type = 'analyze') {
         case 'gemini':
             url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
             headers = { 'Content-Type': 'application/json' };
-            postData = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] });
+            if (type === 'analyze' || type === 'proposal') {
+                postData = JSON.stringify({ 
+                    contents: [{ parts: [{ text: prompt }] }],
+                    generationConfig: {
+                        response_mime_type: "application/json",
+                    }
+                });
+            } else {
+                postData = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] });
+            }
             break;
         case 'deepseek':
             url = 'https://api.deepseek.com/v1/chat/completions';
