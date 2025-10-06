@@ -51,7 +51,7 @@ function createApiRequest(provider, apiKey, promptContent, type = 'analyze') {
         case 'openai':
             url = 'https://api.openai.com/v1/chat/completions';
             headers = { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
-            model = "gpt-4-turbo-preview";
+            model = "gpt-3.5-turbo";
             postData = JSON.stringify({ model, response_format, messages: [{ role: "system", content: "You are a helpful assistant." }, { role: "user", content: prompt }] });
             break;
         case 'gemini':
