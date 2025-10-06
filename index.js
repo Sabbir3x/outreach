@@ -89,7 +89,7 @@ function createApiRequest(provider, apiKey, promptContent, type = 'analyze') {
     }
 
     return new Promise((resolve, reject) => {
-        const req = https.request(url, { method: 'POST', headers, timeout: 30000 }, (res) => {
+        const req = https.request(url, { method: 'POST', headers, timeout: 60000 }, (res) => {
             let body = '';
             res.on('data', (chunk) => body += chunk);
             res.on('end', () => {
