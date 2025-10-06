@@ -11,13 +11,14 @@
   "author": "Minimind Agency",
   "license": "ISC",
   "dependencies": {
+    "@google/generative-ai": "^0.18.0",
     "axios": "^1.6.7",
+    "cheerio": "^1.1.2",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "@google/generative-ai": "^0.18.0",
-    "node-fetch": "^3.3.2",
-    "https-proxy-agent": "^7.0.3"
+    "https-proxy-agent": "^7.0.3",
+    "node-fetch": "^3.3.2"
   },
   "devDependencies": {
     "nodemon": "^3.1.0"

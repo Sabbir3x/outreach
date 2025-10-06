@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const https = require('https');
+const cheerio = require('cheerio');
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -10,8 +11,8 @@ const port = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-// --- 1. SCRAPING FUNCTION (using Bright Data) ---
-async function getPageContent(url) {
+// --- 1. SCRAPING FUNCTION ---
+async function getPageContentAndMeta(url) {
     console.log(`Fetching content via Bright Data Proxy for URL: ${url}`);
     const connectionString = process.env.BRIGHTDATA_CONNECTION_STRING;
     if (!connectionString || connectionString.includes("username:password")) throw new Error("BRIGHTDATA_CONNECTION_STRING is not set correctly.");
@@ -25,14 +26,27 @@ async function getPageContent(url) {
         const request = http.get(options, (res) => {
             let body = '';
             res.on('data', (chunk) => body += chunk);
-            res.on('end', () => res.statusCode >= 200 && res.statusCode < 300 ? resolve(body) : reject(new Error(`Bright Data request failed with status ${res.statusCode}: ${body}`)) );
+            res.on('end', () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    const $ = cheerio.load(body);
+                    const metadata = {
+                        title: $('meta[property="og:title"]').attr('content') || $('title').text(),
+                        description: $('meta[property="og:description"]').attr('content') || $('meta[name="description"]').attr('content') || '',
+                        imageUrl: $('meta[property="og:image"]').attr('content') || '',
+                    };
+                    console.log("Extracted Metadata:", metadata);
+                    resolve({ html: body, metadata });
+                } else {
+                    reject(new Error(`Request failed: ${res.statusCode} ${body}`))
+                }
+            });
         });
         request.on('error', (e) => reject(e));
         request.end();
     });
 }
 
-const ANALYSIS_PROMPT = `Act as a senior design consultant for \"Minimind Agency\", a creative agency specializing in branding, marketing, and web design. Your tone is professional, friendly, and helpful. You are analyzing the following HTML content from a business's Facebook page. Analyze the HTML and text for branding, marketing, and technical issues from a design agency's perspective. Specifically look for: 1.  **Branding & Content:** Is there a clear 'About Us' section? Is the language professional? Are there spelling/grammar errors? Is there a consistent brand message? 2.  **Marketing & CTA:** Is there a clear Call-to-Action (e.g., \"Send Message\", \"Shop Now\")? Is contact information (email, phone) easily found? 3.  **Technical SEO:** Are important meta tags for sharing (like og:title, og:description, og:image) present in the HTML <head>? Is there a link to an external website? Is it mobile-friendly (look for viewport meta tag)? Based on your analysis, you MUST return ONLY a single, minified JSON object. Do not include any text or formatting before or after the JSON object. The JSON object must have the following structure: {\"overall_score\": <an integer score from 0-100 based on the severity and number of issues found>,\"issues\": [ { \"type\": \"Branding\" | \"Marketing\" | \"Content Quality\" | \"Technical SEO\", \"severity\": \"High\" | \"Medium\" | \"Low\", \"description\": \"A concise description of a specific issue found.\" } ],\"suggestions\": [ { \"title\": \"A short, catchy title for a proposal point.\", \"description\": \"A one-sentence description of a service Minimind Agency can offer to fix an issue. Frame it as a solution.\" } ],\"rationale\": \"A 1-2 sentence, human-readable explanation for the score and decision, from the perspective of the AI agent.\" }`;
+const ANALYSIS_PROMPT = `Act as a senior design consultant for \"Minimind Agency\", a creative agency specializing in branding, marketing, and web design. Your tone is professional, friendly, and helpful. You are analyzing the following HTML content from a business's Facebook page. Analyze the HTML and text for branding, marketing, and technical issues from a design agency's perspective. Specifically look for: 1.  **Branding & Content:** Is there a clear 'About Us' section? Is the language professional? Are there spelling/grammar errors? Is there a consistent brand message? 2.  **Marketing & CTA:** Is there a clear Call-to-Action (e.g., \"Send Message\", \"Shop Now\")? Is contact information (email, phone) easily found? 3.  **Technical SEO:** Are important meta tags for sharing (like og:title, og:description, og:image) present in the HTML <head>? Is there a link to an external website? Is it mobile-friendly (look for viewport meta tag)? Based on your analysis, you MUST return ONLY a single, minified JSON object. Do not include any text or formatting before or after the JSON object. The JSON object must have the following structure: {\"overall_score\": <an integer score from 0-100 based on the severity and number of issues found>},\"issues\": [ { \"type\": \"Branding\" | \"Marketing\" | \"Content Quality\" | \"Technical SEO\", \"severity\": \"High\" | \"Medium\" | \"Low\", \"description\": \"A concise description of a specific issue found.\" } ],\"suggestions\": [ { \"title\": \"A short, catchy title for a proposal point.\", \"description\": \"A one-sentence description of a service Minimind Agency can offer to fix an issue. Frame it as a solution.\" } ],\"rationale\": \"A 1-2 sentence, human-readable explanation for the score and decision, from the perspective of the AI agent.\" }`;
 
 // --- 2. DYNAMIC AI ANALYSIS FUNCTION ---
 function createApiRequest(provider, apiKey, promptContent, type = 'analyze') {
@@ -55,7 +69,7 @@ function createApiRequest(provider, apiKey, promptContent, type = 'analyze') {
             postData = JSON.stringify({ model, response_format, messages: [{ role: "system", content: "You are a helpful assistant." }, { role: "user", content: prompt }] });
             break;
         case 'gemini':
-            url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
+            url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`;
             headers = { 'Content-Type': 'application/json' };
             postData = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] });
             break;
@@ -112,14 +126,15 @@ app.post('/analyze', async (req, res) => {
     if (!pageUrl || !pageName) return res.status(400).json({ error: 'pageUrl and pageName are required.' });
 
     try {
-        const htmlContent = await getPageContent(pageUrl);
+        const { html, metadata } = await getPageContentAndMeta(pageUrl);
         const provider = process.env.API_PROVIDER?.toLowerCase();
         const apiKey = process.env[`${provider.toUpperCase()}_API_KEY`];
         if (!apiKey || apiKey.includes('Your-')) throw new Error(`API key for '${provider}' is not set correctly.`);
 
         console.log(`Using AI Provider: ${provider} for analysis`);
-        const analysisResult = await createApiRequest(provider, apiKey, { content: htmlContent, pageName: pageName }, 'analyze');
-        res.status(200).json(analysisResult);
+        const analysisResult = await createApiRequest(provider, apiKey, { content: html, pageName: pageName }, 'analyze');
+        
+        res.status(200).json({ ...analysisResult, metadata });
 
     } catch (error) {
         console.error("Error in /analyze endpoint:", error.message);
