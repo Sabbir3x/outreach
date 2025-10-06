@@ -3,11 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const https = require('https');
-const { createClient } = require('@supabase/supabase-js');
-
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
 const cheerio = require('cheerio');
 
 const app = express();
@@ -127,62 +122,18 @@ function createApiRequest(provider, apiKey, promptContent, type = 'analyze') {
 
 // --- 3. MAIN API ENDPOINTS ---
 app.post('/analyze', async (req, res) => {
-    const { pageUrl, pageName, userId } = req.body; // Assuming userId is sent from frontend
+    const { pageUrl, pageName } = req.body;
     if (!pageUrl || !pageName) return res.status(400).json({ error: 'pageUrl and pageName are required.' });
 
     try {
-        // 1. Fetch page content
         const htmlContent = await getPageContent(pageUrl);
-
-        // 2. Find or create the page in DB
-        let { data: page, error: pageError } = await supabase
-            .from('pages')
-            .select('id')
-            .eq('url', pageUrl)
-            .single();
-
-        if (pageError && pageError.code !== 'PGRST116') { // PGRST116: row not found
-            throw new Error(`Supabase page query error: ${pageError.message}`);
-        }
-
-        if (!page) {
-            const { data: newPage, error: newPageError } = await supabase
-                .from('pages')
-                .insert({ url: pageUrl, name: pageName, created_by: userId }) // userId should be passed from frontend
-                .select('id')
-                .single();
-            if (newPageError) throw new Error(`Supabase page insert error: ${newPageError.message}`);
-            page = newPage;
-        }
-
-        // 3. Run AI Analysis
         const provider = process.env.API_PROVIDER?.toLowerCase();
         const apiKey = process.env[`${provider.toUpperCase()}_API_KEY`];
         if (!apiKey || apiKey.includes('Your-')) throw new Error(`API key for '${provider}' is not set correctly.`);
-        
+
         console.log(`Using AI Provider: ${provider} for analysis`);
         const analysisResult = await createApiRequest(provider, apiKey, { content: htmlContent, pageName: pageName }, 'analyze');
-
-        // 4. Save analysis to DB
-        const { error: analysisError } = await supabase.from('analyses').insert({
-            page_id: page.id,
-            overall_score: analysisResult.overall_score,
-            issues: analysisResult.issues,
-            suggestions: analysisResult.suggestions,
-            rationale: analysisResult.rationale,
-            need_decision: 'maybe', // Placeholder, this should come from the AI
-            confidence_score: 0.9, // Placeholder
-            analyzed_by: userId, // userId should be passed from frontend
-        });
-
-        if (analysisError) {
-            console.error('Supabase analysis insert error:', analysisError.message);
-            // Non-critical, so we don't throw, just log it. The user still gets the result.
-        }
         
-        // 5. Update last_analyzed_at for the page
-        await supabase.from('pages').update({ last_analyzed_at: new Date().toISOString() }).eq('id', page.id);
-
         res.status(200).json(analysisResult);
 
     } catch (error) {
