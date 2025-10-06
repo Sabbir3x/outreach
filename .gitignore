@@ -1,0 +1,19 @@
+
+# Dependencies
+/node_modules
+
+# Environment variables
+.env
+
+# Production
+/build
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Misc
+.DS_Store
+.cache
