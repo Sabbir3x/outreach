@@ -55,7 +55,7 @@ function createApiRequest(provider, apiKey, promptContent, type = 'analyze') {
             postData = JSON.stringify({ model, response_format, messages: [{ role: "system", content: "You are a helpful assistant." }, { role: "user", content: prompt }] });
             break;
         case 'gemini':
-            url = `https://generativelanguage.googleapis.com/v1/models/gemini-pro:generateContent?key=${apiKey}`;
+            url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
             headers = { 'Content-Type': 'application/json' };
             postData = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] });
             break;
