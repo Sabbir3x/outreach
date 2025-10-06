@@ -131,7 +131,7 @@ app.post('/analyze', async (req, res) => {
     if (!pageUrl || !pageName) return res.status(400).json({ error: 'pageUrl and pageName are required.' });
 
     try {
-        const htmlContent = await getPageContent(pageUrl);
+        const { html: htmlContent, metadata } = await getPageContentAndMeta(pageUrl);
         const provider = process.env.API_PROVIDER?.toLowerCase();
         const apiKey = process.env[`${provider.toUpperCase()}_API_KEY`];
         if (!apiKey || apiKey.includes('Your-')) throw new Error(`API key for '${provider}' is not set correctly.`);
