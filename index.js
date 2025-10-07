@@ -52,10 +52,17 @@ async function getPageContentAndMeta(url) {
             res.on('end', () => {
                 if (res.statusCode >= 200 && res.statusCode < 300) {
                     const $ = cheerio.load(body);
+
+                    // Simple regex to find email addresses
+                    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+                    const foundEmails = body.match(emailRegex);
+                    const firstEmail = foundEmails ? foundEmails[0] : null;
+
                     const metadata = {
                         title: $('meta[property="og:title"]').attr('content') || $('title').text(),
                         description: $('meta[property="og:description"]').attr('content') || $('meta[name="description"]').attr('content') || '',
                         imageUrl: $('meta[property="og:image"]').attr('content') || '',
+                        contactEmail: firstEmail,
                     };
                     console.log("Extracted Metadata:", metadata);
                     resolve({ html: body, metadata });
@@ -444,6 +451,71 @@ app.delete('/settings/smtp', async (req, res) => {
         res.status(200).json({ message: 'SMTP settings deleted successfully.' });
     } catch (error) {
         console.error("Error deleting SMTP settings:", error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// --- Facebook Settings Endpoints ---
+app.get('/settings/facebook', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('secure_settings')
+            .select('key, value')
+            .in('key', ['facebook_page_id', 'facebook_page_name']);
+
+        if (error) throw error;
+
+        const settings = data.reduce((acc, setting) => {
+            acc[setting.key] = setting.value;
+            return acc;
+        }, {});
+
+        res.status(200).json(settings);
+    } catch (error) {
+        console.error("Error fetching Facebook status:", error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/settings/facebook/connect', async (req, res) => {
+    const { userId, accessToken, pageId, pageName } = req.body;
+    if (!userId || !accessToken || !pageId || !pageName) {
+        return res.status(400).json({ error: 'Missing required Facebook connection data.' });
+    }
+
+    try {
+        // In a real app, you would exchange the short-lived accessToken for a long-lived one here.
+        // For now, we'll just save the provided one (assuming it's already long-lived or handled by frontend).
+        const settingsToUpsert = [
+            { key: 'facebook_page_id', value: pageId, updated_by: userId },
+            { key: 'facebook_page_name', value: pageName, updated_by: userId },
+            { key: 'facebook_page_access_token', value: encrypt(accessToken), updated_by: userId },
+        ];
+
+        const { error } = await supabase.from('secure_settings').upsert(settingsToUpsert, { onConflict: 'key' });
+
+        if (error) throw new Error(`Failed to save Facebook settings: ${error.message}`);
+
+        res.status(200).json({ message: 'Facebook page connected successfully.' });
+
+    } catch (error) {
+        console.error("Error connecting Facebook page:", error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/settings/facebook', async (req, res) => {
+    try {
+        const { error } = await supabase
+            .from('secure_settings')
+            .delete()
+            .in('key', ['facebook_page_id', 'facebook_page_name', 'facebook_page_access_token']);
+
+        if (error) throw new Error(`Failed to delete Facebook settings: ${error.message}`);
+
+        res.status(200).json({ message: 'Facebook settings deleted successfully.' });
+    } catch (error) {
+        console.error("Error deleting Facebook settings:", error.message);
         res.status(500).json({ error: error.message });
     }
 });
