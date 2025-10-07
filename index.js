@@ -352,9 +352,7 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
                     try {
                         const decryptedPass = decrypt(smtpConfig.smtp_pass);
                         const transporter = nodemailer.createTransport({
-                            host: smtpConfig.smtp_host,
-                            port: parseInt(smtpConfig.smtp_port, 10),
-                            secure: parseInt(smtpConfig.smtp_port, 10) === 465,
+                            service: 'gmail',
                             auth: { user: smtpConfig.smtp_user, pass: decryptedPass },
                         });
 
