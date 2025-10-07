@@ -320,7 +320,7 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
 
             if (draftsError) throw new Error(`Failed to fetch approved drafts: ${draftsError.message}`);
             if (!drafts || drafts.length === 0) {
-                console.log("No approved drafts to send for this campaign.");
+                console.log("No approved drafts found to send for this campaign.");
                 return;
             }
 
@@ -333,6 +333,7 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
                 .in('key', ['smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass']);
             
             if (settingsError) {
+                console.error("Error fetching SMTP settings:", settingsError.message);
                 console.warn("Could not fetch SMTP settings. Email sending will be skipped.");
             }
 
@@ -340,6 +341,10 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
                 acc[setting.key] = setting.value;
                 return acc;
             }, {}) : {};
+
+            if (!smtpConfig.smtp_pass) {
+                console.warn("SMTP password is not configured. Email sending will be skipped.");
+            }
 
             for (const draft of drafts) {
                 let sent = false;
