@@ -307,7 +307,7 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
 
             const { data: drafts, error: draftsError } = await supabase
                 .from('drafts')
-                .select('id, page_id')
+                .select('*, pages(contact_email)') // Fetch contact_email from related page
                 .eq('campaign_id', campaignId)
                 .eq('status', 'approved');
 
@@ -325,56 +325,58 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
                 .select('key, value')
                 .in('key', ['smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass']);
             
-            if (settingsError) throw new Error("Could not fetch SMTP settings.");
-            if (settingsData.length < 4) throw new Error("SMTP is not fully configured.");
+            if (settingsError) {
+                console.warn("Could not fetch SMTP settings. Email sending will be skipped.");
+            }
 
-            const smtpConfig = settingsData.reduce((acc, setting) => {
+            const smtpConfig = settingsData ? settingsData.reduce((acc, setting) => {
                 acc[setting.key] = setting.value;
                 return acc;
-            }, {});
-
-            const decryptedPass = decrypt(smtpConfig.smtp_pass);
-
-            const transporter = nodemailer.createTransport({
-                host: smtpConfig.smtp_host,
-                port: parseInt(smtpConfig.smtp_port, 10),
-                secure: parseInt(smtpConfig.smtp_port, 10) === 465, // true for 465, false for other ports
-                auth: {
-                    user: smtpConfig.smtp_user,
-                    pass: decryptedPass,
-                },
-            });
+            }, {}) : {};
 
             for (const draft of drafts) {
-                console.log(`Sending email for draft ${draft.id} to ${draft.pages.contact_email}...`);
-                
-                try {
-                    await transporter.sendMail({
-                        from: `"Minimind Agency" <${smtpConfig.smtp_user}>`,
-                        to: draft.pages.contact_email, // Assuming the page has a contact email
-                        subject: draft.email_subject,
-                        html: draft.email_body,
-                    });
+                let sent = false;
+                if (draft.send_to_email && smtpConfig.smtp_pass) {
+                    try {
+                        const decryptedPass = decrypt(smtpConfig.smtp_pass);
+                        const transporter = nodemailer.createTransport({
+                            host: smtpConfig.smtp_host,
+                            port: parseInt(smtpConfig.smtp_port, 10),
+                            secure: parseInt(smtpConfig.smtp_port, 10) === 465,
+                            auth: { user: smtpConfig.smtp_user, pass: decryptedPass },
+                        });
 
-                    // Update status only after successful sending
+                        console.log(`Sending email for draft ${draft.id} to ${draft.pages.contact_email}...`);
+                        await transporter.sendMail({
+                            from: `"Minimind Agency" <${smtpConfig.smtp_user}>`,
+                            to: draft.pages.contact_email,
+                            subject: draft.email_subject,
+                            html: draft.email_body,
+                        });
+                        sent = true;
+                        console.log(`Email sent for draft ${draft.id}`);
+                    } catch (emailError) {
+                        console.error(`Failed to send email for draft ${draft.id}:`, emailError.message);
+                    }
+                }
+
+                if (draft.send_to_facebook) {
+                    // TODO: Add Facebook sending logic here
+                    console.log(`Simulating Facebook message send for draft ${draft.id}`);
+                    sent = true; // Mark as sent for simulation purposes
+                }
+
+                if (sent) {
                     const { error: updateError } = await supabase
                         .from('drafts')
                         .update({ status: 'sent', sent_at: new Date().toISOString() })
                         .eq('id', draft.id);
-                    
-                    if (updateError) {
-                        console.error(`Failed to update status for draft ${draft.id}:`, updateError.message);
-                    } else {
-                        console.log(`Successfully sent and updated draft ${draft.id}`);
-                    }
-
-                } catch (emailError) {
-                    console.error(`Failed to send email for draft ${draft.id}:`, emailError.message);
-                    // Optional: Update draft with an error status
-                    await supabase.from('drafts').update({ status: 'failed' }).eq('id', draft.id);
+                    if (updateError) console.error(`Failed to update status for draft ${draft.id}:`, updateError.message);
+                } else {
+                    console.warn(`Draft ${draft.id} was not sent to any channel.`);
                 }
 
-                await new Promise(resolve => setTimeout(resolve, SEND_INTERVAL_MS)); // Wait for the interval
+                await new Promise(resolve => setTimeout(resolve, SEND_INTERVAL_MS));
             }
             console.log(`Bulk send finished for campaign: ${campaignId}`);
         } catch (error) {
