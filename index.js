@@ -288,16 +288,16 @@ const SEND_INTERVAL_MS = 10000; // 10 seconds between each message
 
 app.post('/campaigns/:id/send-all', async (req, res) => {
     const { id: campaignId } = req.params;
-    const { userId } = req.body;
+    const { userId, channel } = req.body; // channel can be 'email', 'facebook', or 'both'
 
-    if (!userId) return res.status(400).json({ error: 'userId is required.' });
+    if (!userId || !channel) return res.status(400).json({ error: 'userId and channel are required.' });
 
     res.status(202).json({ message: "Bulk send process started. Messages will be sent in the background." });
 
     // Run the sending process in the background
     (async () => {
         try {
-            console.log(`Starting bulk send for campaign: ${campaignId}`);
+            console.log(`Starting bulk send for campaign: ${campaignId} with channel: ${channel}`);
 
             // First, check if the campaign is active
             const { data: campaign, error: campaignError } = await supabase
@@ -343,7 +343,7 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
 
             for (const draft of drafts) {
                 let sent = false;
-                if (draft.send_to_email && smtpConfig.smtp_pass) {
+                if ((channel === 'email' || channel === 'both') && draft.send_to_email && smtpConfig.smtp_pass) {
                     try {
                         const decryptedPass = decrypt(smtpConfig.smtp_pass);
                         const transporter = nodemailer.createTransport({
@@ -367,7 +367,7 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
                     }
                 }
 
-                if (draft.send_to_facebook) {
+                if ((channel === 'facebook' || channel === 'both') && draft.send_to_facebook) {
                     // TODO: Add Facebook sending logic here
                     console.log(`Simulating Facebook message send for draft ${draft.id}`);
                     sent = true; // Mark as sent for simulation purposes
@@ -516,6 +516,71 @@ app.delete('/settings/facebook', async (req, res) => {
         res.status(200).json({ message: 'Facebook settings deleted successfully.' });
     } catch (error) {
         console.error("Error deleting Facebook settings:", error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/drafts/custom', async (req, res) => {
+    const { 
+        userId, mode, pageName, pageUrl, contactEmail, 
+        aiNotes, fbMessage, emailSubject, emailBody 
+    } = req.body;
+
+    if (!userId || !pageName || !pageUrl) {
+        return res.status(400).json({ error: 'User, Page Name, and Page URL are required.' });
+    }
+
+    try {
+        // 1. Upsert the page
+        const { data: page, error: pageError } = await supabase
+            .from('pages')
+            .upsert({ url: pageUrl, name: pageName, contact_email: contactEmail, created_by: userId }, { onConflict: 'url' })
+            .select()
+            .single();
+
+        if (pageError) throw new Error(`Failed to upsert page: ${pageError.message}`);
+
+        let finalFbMessage = fbMessage;
+        let finalEmailSubject = emailSubject;
+        let finalEmailBody = emailBody;
+
+        // 2. If AI mode, generate content
+        if (mode === 'ai') {
+            const aiPrompt = `Act as a design consultant. Based on these notes: "${aiNotes}", write a short Facebook message and a professional email proposal for the page "${pageName}". Return ONLY a minified JSON object: {"facebook_message": "...", "email_subject": "...", "email_body": "..."}`;
+            
+            const provider = process.env.API_PROVIDER?.toLowerCase();
+            const apiKey = process.env[`${provider.toUpperCase()}_API_KEY`];
+            const aiResultRaw = await createApiRequest(provider, apiKey, aiPrompt, 'proposal');
+            
+            const jsonMatch = aiResultRaw.match(/\{.*\}/s);
+            if (!jsonMatch) throw new Error("AI returned non-JSON response.");
+            const proposalContent = JSON.parse(jsonMatch[0]);
+
+            finalFbMessage = proposalContent.facebook_message;
+            finalEmailSubject = proposalContent.email_subject;
+            finalEmailBody = proposalContent.email_body;
+        }
+
+        // 3. Save the new draft
+        const { data: newDraft, error: draftError } = await supabase
+            .from('drafts')
+            .insert({
+                page_id: page.id,
+                created_by: userId,
+                fb_message: finalFbMessage,
+                email_subject: finalEmailSubject,
+                email_body: finalEmailBody,
+                status: 'pending'
+            })
+            .select()
+            .single();
+
+        if (draftError) throw new Error(`Failed to save draft: ${draftError.message}`);
+
+        res.status(201).json(newDraft);
+
+    } catch (error) {
+        console.error("Error in /drafts/custom endpoint:", error.message);
         res.status(500).json({ error: error.message });
     }
 });
