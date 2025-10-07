@@ -5,6 +5,24 @@ const http = require('http');
 const https = require('https');
 const { createClient } = require('@supabase/supabase-js');
 const cheerio = require('cheerio');
+const CryptoJS = require('crypto-js');
+const nodemailer = require('nodemailer');
+
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+if (!ENCRYPTION_KEY) {
+    throw new Error("ENCRYPTION_KEY is not set in environment variables.");
+}
+
+// Helper functions for encryption and decryption
+const encrypt = (text) => {
+    return CryptoJS.AES.encrypt(text, ENCRYPTION_KEY).toString();
+};
+
+const decrypt = (ciphertext) => {
+    const bytes = CryptoJS.AES.decrypt(ciphertext, ENCRYPTION_KEY);
+    return bytes.toString(CryptoJS.enc.Utf8);
+};
+
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
@@ -230,7 +248,6 @@ app.post('/create-proposal', async (req, res) => {
         const apiKey = process.env[`${provider.toUpperCase()}_API_KEY`];
         const aiResultRaw = await createApiRequest(provider, apiKey, prompt, 'proposal');
         
-        // Ensure the result is a valid JSON object
         const jsonMatch = aiResultRaw.match(/\{.*\}/s);
         if (!jsonMatch) throw new Error("AI returned non-JSON response for proposal.");
         const proposalContent = JSON.parse(jsonMatch[0]);
@@ -252,11 +269,179 @@ app.post('/create-proposal', async (req, res) => {
 
         if (draftError) throw new Error(`Failed to save draft: ${draftError.message}`);
 
-        // 5. Return the newly created draft
         res.status(201).json(newDraft);
 
     } catch (error) {
         console.error("Error in /create-proposal endpoint:", error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+const SEND_INTERVAL_MS = 10000; // 10 seconds between each message
+
+app.post('/campaigns/:id/send-all', async (req, res) => {
+    const { id: campaignId } = req.params;
+    const { userId } = req.body;
+
+    if (!userId) return res.status(400).json({ error: 'userId is required.' });
+
+    res.status(202).json({ message: "Bulk send process started. Messages will be sent in the background." });
+
+    // Run the sending process in the background
+    (async () => {
+        try {
+            console.log(`Starting bulk send for campaign: ${campaignId}`);
+
+            // First, check if the campaign is active
+            const { data: campaign, error: campaignError } = await supabase
+                .from('campaigns')
+                .select('status')
+                .eq('id', campaignId)
+                .single();
+
+            if (campaignError) throw new Error(`Failed to fetch campaign status: ${campaignError.message}`);
+            if (campaign.status !== 'active') {
+                console.log(`Campaign ${campaignId} is not active. Aborting bulk send.`);
+                return;
+            }
+
+            const { data: drafts, error: draftsError } = await supabase
+                .from('drafts')
+                .select('id, page_id')
+                .eq('campaign_id', campaignId)
+                .eq('status', 'approved');
+
+            if (draftsError) throw new Error(`Failed to fetch approved drafts: ${draftsError.message}`);
+            if (!drafts || drafts.length === 0) {
+                console.log("No approved drafts to send for this campaign.");
+                return;
+            }
+
+            console.log(`Found ${drafts.length} approved drafts to send.`);
+
+            // Fetch SMTP settings once for the campaign
+            const { data: settingsData, error: settingsError } = await supabase
+                .from('secure_settings')
+                .select('key, value')
+                .in('key', ['smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass']);
+            
+            if (settingsError) throw new Error("Could not fetch SMTP settings.");
+            if (settingsData.length < 4) throw new Error("SMTP is not fully configured.");
+
+            const smtpConfig = settingsData.reduce((acc, setting) => {
+                acc[setting.key] = setting.value;
+                return acc;
+            }, {});
+
+            const decryptedPass = decrypt(smtpConfig.smtp_pass);
+
+            const transporter = nodemailer.createTransport({
+                host: smtpConfig.smtp_host,
+                port: parseInt(smtpConfig.smtp_port, 10),
+                secure: parseInt(smtpConfig.smtp_port, 10) === 465, // true for 465, false for other ports
+                auth: {
+                    user: smtpConfig.smtp_user,
+                    pass: decryptedPass,
+                },
+            });
+
+            for (const draft of drafts) {
+                console.log(`Sending email for draft ${draft.id} to ${draft.pages.contact_email}...`);
+                
+                try {
+                    await transporter.sendMail({
+                        from: `"Minimind Agency" <${smtpConfig.smtp_user}>`,
+                        to: draft.pages.contact_email, // Assuming the page has a contact email
+                        subject: draft.email_subject,
+                        html: draft.email_body,
+                    });
+
+                    // Update status only after successful sending
+                    const { error: updateError } = await supabase
+                        .from('drafts')
+                        .update({ status: 'sent', sent_at: new Date().toISOString() })
+                        .eq('id', draft.id);
+                    
+                    if (updateError) {
+                        console.error(`Failed to update status for draft ${draft.id}:`, updateError.message);
+                    } else {
+                        console.log(`Successfully sent and updated draft ${draft.id}`);
+                    }
+
+                } catch (emailError) {
+                    console.error(`Failed to send email for draft ${draft.id}:`, emailError.message);
+                    // Optional: Update draft with an error status
+                    await supabase.from('drafts').update({ status: 'failed' }).eq('id', draft.id);
+                }
+
+                await new Promise(resolve => setTimeout(resolve, SEND_INTERVAL_MS)); // Wait for the interval
+            }
+            console.log(`Bulk send finished for campaign: ${campaignId}`);
+        } catch (error) {
+            console.error(`Error during bulk send for campaign ${campaignId}:`, error.message);
+        }
+    })();
+});
+
+app.post('/settings/smtp', async (req, res) => {
+    const { userId, host, port, user, pass } = req.body;
+    if (!userId || !host || !port || !user || !pass) {
+        return res.status(400).json({ error: 'Missing required SMTP settings.' });
+    }
+
+    try {
+        const settingsToUpsert = [
+            { key: 'smtp_host', value: host, updated_by: userId },
+            { key: 'smtp_port', value: port.toString(), updated_by: userId },
+            { key: 'smtp_user', value: user, updated_by: userId },
+            { key: 'smtp_pass', value: encrypt(pass), updated_by: userId }, // Encrypt the password
+        ];
+
+        const { error } = await supabase.from('secure_settings').upsert(settingsToUpsert, { onConflict: 'key' });
+
+        if (error) throw new Error(`Failed to save SMTP settings: ${error.message}`);
+
+        res.status(200).json({ message: 'SMTP settings saved successfully.' });
+
+    } catch (error) {
+        console.error("Error saving SMTP settings:", error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/settings/smtp', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('secure_settings')
+            .select('key, value')
+            .in('key', ['smtp_host', 'smtp_user']);
+
+        if (error) throw error;
+
+        const settings = data.reduce((acc, setting) => {
+            acc[setting.key] = setting.value;
+            return acc;
+        }, {});
+
+        res.status(200).json(settings);
+    } catch (error) {
+        console.error("Error fetching SMTP status:", error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/settings/smtp', async (req, res) => {
+    try {
+        const { error } = await supabase
+            .from('secure_settings')
+            .delete()
+            .in('key', ['smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass']);
+
+        if (error) throw new Error(`Failed to delete SMTP settings: ${error.message}`);
+
+        res.status(200).json({ message: 'SMTP settings deleted successfully.' });
+    } catch (error) {
+        console.error("Error deleting SMTP settings:", error.message);
         res.status(500).json({ error: error.message });
     }
 });
