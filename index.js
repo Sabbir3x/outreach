@@ -314,7 +314,7 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
 
             const { data: drafts, error: draftsError } = await supabase
                 .from('drafts')
-                .select('*, pages(contact_email)') // Fetch contact_email from related page
+                .select('*, pages(*)') // Fetch all page data
                 .eq('campaign_id', campaignId)
                 .eq('status', 'approved');
 
