@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const https = require('https');
+const bodyParser = require('body-parser');
 const { createClient } = require('@supabase/supabase-js');
 const cheerio = require('cheerio');
 const CryptoJS = require('crypto-js');
@@ -32,7 +33,8 @@ const app = express();
 const port = process.env.PORT || 3001;
 
 app.use(cors());
-app.use(express.json());
+app.use(bodyParser.json({ limit: '5mb' }));
+app.use(bodyParser.urlencoded({ limit: '5mb', extended: true }));
 
 // --- 1. SCRAPING FUNCTION ---
 async function getPageContentAndMeta(url) {
