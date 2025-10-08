@@ -9,6 +9,20 @@ const cheerio = require('cheerio');
 const CryptoJS = require('crypto-js');
 const nodemailer = require('nodemailer');
 
+process.on('uncaughtException', (error, origin) => {
+    console.error('----- Uncaught exception -----');
+    console.error(error);
+    console.error('----- Origin -----');
+    console.error(origin);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('----- Unhandled Rejection at -----');
+    console.error(promise);
+    console.error('----- Reason -----');
+    console.error(reason);
+});
+
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 if (!ENCRYPTION_KEY) {
     throw new Error("ENCRYPTION_KEY is not set in environment variables.");
@@ -318,6 +332,7 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
                 console.log(`Campaign ${campaignId} is not active. Aborting bulk send.`);
                 return;
             }
+            console.log("Step 1: Campaign status confirmed as active.");
 
             const { data: drafts, error: draftsError } = await supabase
                 .from('drafts')
@@ -326,12 +341,12 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
                 .eq('status', 'approved');
 
             if (draftsError) throw new Error(`Failed to fetch approved drafts: ${draftsError.message}`);
+            
             if (!drafts || drafts.length === 0) {
                 console.log("No approved drafts found to send for this campaign.");
                 return;
             }
-
-            console.log(`Found ${drafts.length} approved drafts to send.`);
+            console.log(`Step 2: Found ${drafts.length} approved drafts.`);
 
             // Fetch SMTP settings once for the campaign
             const { data: settingsData, error: settingsError } = await supabase
@@ -341,8 +356,9 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
             
             if (settingsError) {
                 console.error("Error fetching SMTP settings:", settingsError.message);
-                console.warn("Could not fetch SMTP settings. Email sending will be skipped.");
+                return; // Stop execution if settings can't be fetched
             }
+            console.log("Step 3: Fetched secure settings from DB.");
 
             const smtpConfig = settingsData ? settingsData.reduce((acc, setting) => {
                 acc[setting.key] = setting.value;
@@ -350,8 +366,25 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
             }, {}) : {};
 
             if (!smtpConfig.smtp_pass) {
-                console.warn("SMTP password is not configured. Email sending will be skipped.");
+                console.warn("SMTP password is not configured in secure_settings. Aborting email send.");
+                return;
             }
+            console.log("Step 4: SMTP config constructed.");
+
+            const decryptedPass = decrypt(smtpConfig.smtp_pass);
+            console.log("Step 5: SMTP password decrypted.");
+
+            const transporter = nodemailer.createTransport({
+                host: smtpConfig.smtp_host,
+                port: parseInt(smtpConfig.smtp_port, 10),
+                secure: true, // true for 465
+                auth: { user: smtpConfig.smtp_user, pass: decryptedPass },
+                tls: {
+                    ciphers:'SSLv3'
+                },
+                requireTLS: true,
+            });
+            console.log("Step 6: Nodemailer transporter created.");
 
             for (const draft of drafts) {
                 let sent = false;
