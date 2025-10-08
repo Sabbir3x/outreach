@@ -354,8 +354,12 @@ app.post('/campaigns/:id/send-all', async (req, res) => {
                         const transporter = nodemailer.createTransport({
                             host: smtpConfig.smtp_host,
                             port: parseInt(smtpConfig.smtp_port, 10),
-                            secure: true, // Use true for port 465, false for other ports like 587
+                            secure: true, // true for 465
                             auth: { user: smtpConfig.smtp_user, pass: decryptedPass },
+                            tls: {
+                                ciphers:'SSLv3'
+                            },
+                            requireTLS: true,
                         });
 
                         console.log(`Sending email for draft ${draft.id} to ${draft.pages.contact_email}...`);
