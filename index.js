@@ -38,9 +38,9 @@ const oauth2Client = new google.auth.OAuth2(
 );
 
 // --- Helper Functions ---
-async function getGmailClient(userId) {
-    const { data } = await supabase.from('secure_settings').select('value').eq('key', `google_refresh_token_${userId}`).single();
-    if (!data || !data.value) throw new Error('Gmail not connected for this user.');
+async function getGmailClient() {
+    const { data } = await supabase.from('secure_settings').select('value').eq('key', 'google_refresh_token_team').single();
+    if (!data || !data.value) throw new Error('Gmail not connected for the team.');
     const refreshToken = decrypt(data.value);
     oauth2Client.setCredentials({ refresh_token: refreshToken });
     return google.gmail({ version: 'v1', auth: oauth2Client });
@@ -136,12 +136,11 @@ app.get('/test', (req, res) => res.status(200).json({ message: "Backend is alive
 
 // Auth
 app.get('/auth/google', (req, res) => {
-    const { userId } = req.query;
-    const url = oauth2Client.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.modify'], state: userId });
+    const url = oauth2Client.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.modify'] });
     res.redirect(url);
 });
 app.get('/auth/google/callback', async (req, res) => {
-    const { code, state: userId } = req.query;
+    const { code } = req.query;
     try {
         const { tokens } = await oauth2Client.getToken(code);
         if (!tokens.refresh_token) throw new Error("Refresh token not received.");
@@ -149,8 +148,8 @@ app.get('/auth/google/callback', async (req, res) => {
         const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
         const profile = await gmail.users.getProfile({ userId: 'me' });
         await supabase.from('secure_settings').upsert([
-            { key: `google_refresh_token_${userId}`, value: encrypt(tokens.refresh_token) },
-            { key: `google_user_email_${userId}`, value: profile.data.emailAddress }
+            { key: 'google_refresh_token_team', value: encrypt(tokens.refresh_token) },
+            { key: 'google_user_email_team', value: profile.data.emailAddress }
         ], { onConflict: 'key' });
         res.redirect(`${process.env.FRONTEND_URL}?view=settings&status=google_connected`);
     } catch (error) {
@@ -159,21 +158,18 @@ app.get('/auth/google/callback', async (req, res) => {
     }
 });
 app.get('/auth/google/status', async (req, res) => {
-    const { userId } = req.query;
-    const { data } = await supabase.from('secure_settings').select('value').eq('key', `google_user_email_${userId}`).single();
+    const { data } = await supabase.from('secure_settings').select('value').eq('key', 'google_user_email_team').single();
     if (data && data.value) res.json({ connected: true, email: data.value });
     else res.json({ connected: false });
 });
 app.post('/auth/google/disconnect', async (req, res) => {
-    const { userId } = req.body;
-    await supabase.from('secure_settings').delete().like('key', `%_${userId}`);
+    await supabase.from('secure_settings').delete().like('key', '%_team');
     res.json({ message: "Disconnected successfully" });
 });
 
 app.post('/auth/google/watch', async (req, res) => {
-    const { userId } = req.body;
     try {
-        const gmail = await getGmailClient(userId);
+        const gmail = await getGmailClient();
         const response = await gmail.users.watch({
             userId: 'me',
             requestBody: {
@@ -242,9 +238,9 @@ app.post('/drafts/custom', async (req, res) => {
 });
 app.post('/drafts/:id/send', async (req, res) => {
     const { id: draftId } = req.params;
-    const { userId } = req.body;
+    const { userId } = req.body; // userId is still used to log the sender
     try {
-        const gmail = await getGmailClient(userId);
+        const gmail = await getGmailClient();
         const { data: draft } = await supabase.from('drafts').select('*, pages(*)').eq('id', draftId).single();
         if (!draft) throw new Error("Draft not found.");
         let messageId = null;
@@ -267,7 +263,40 @@ app.post('/drafts/:id/send', async (req, res) => {
 app.post('/campaigns/:id/send-all', async (req, res) => { /* ... */ });
 
 // Conversations
-app.post('/replies/send', async (req, res) => { /* ... */ });
+app.post('/replies/send', async (req, res) => {
+    const { userId, pageId, content } = req.body;
+    try {
+        const gmail = await getGmailClient();
+        const { data: page } = await supabase.from('pages').select('contact_email, name').eq('id', pageId).single();
+        if (!page) throw new Error("Page not found.");
+
+        const subject = `Re: Your inquiry about ${page.name}`;
+        const emailLines = [
+            `To: ${page.contact_email}`,
+            `Subject: ${subject}`,
+            'Content-Type: text/html; charset=utf-8',
+            'MIME-Version: 1.0',
+            '',
+            content.replace(/\n/g, '<br>')
+        ];
+        const rawEmail = Buffer.from(emailLines.join('\r\n')).toString('base64');
+        const sentEmail = await gmail.users.messages.send({ userId: 'me', requestBody: { raw: rawEmail } });
+
+        await supabase.from('replies').insert({
+            page_id: pageId,
+            content: content,
+            platform: 'email',
+            is_reply: true, // This is an outgoing reply from an agent
+            sent_by: userId,
+            provider_message_id: sentEmail.data.id
+        });
+
+        res.status(200).json({ message: "Reply sent successfully." });
+    } catch (error) {
+        console.error('Error sending reply:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
 app.delete('/conversations/:pageId', async (req, res) => { /* ... */ });
 
 const mailparser = require('mailparser');
@@ -288,40 +317,23 @@ app.post('/google/webhook', async (req, res) => {
         const data = JSON.parse(decodedData);
         const { emailAddress, historyId } = data;
 
-        console.log(`Processing notification for ${emailAddress} with historyId ${historyId}`);
+        console.log(`Processing notification for team account ${emailAddress} with historyId ${historyId}`);
 
-        // Find user by email
-        const { data: userSetting, error: userError } = await supabase
-            .from('secure_settings')
-            .select('key')
-            .eq('value', emailAddress)
-            .like('key', 'google_user_email_%')
-            .single();
-
-        if (userError || !userSetting) {
-            console.error(`Could not find user for email: ${emailAddress}`);
-            return res.status(404).send('User not found');
-        }
-
-        const userId = userSetting.key.split('_').pop();
-
-        // Get last history ID
+        // Get last history ID for the team
         const { data: historySetting } = await supabase
             .from('secure_settings')
             .select('value')
-            .eq('key', `google_history_id_${userId}`)
+            .eq('key', 'google_history_id_team')
             .single();
 
         const startHistoryId = historySetting ? decrypt(historySetting.value) : null;
         if (!startHistoryId) {
-            console.log(`No startHistoryId for user ${userId}, will process all messages and set it.`);
-            // If no historyId, we should probably fetch all messages and set it.
-            // For now, we'll just log and update to the new historyId to avoid processing all emails on first notification.
-             await supabase.from('secure_settings').upsert({ key: `google_history_id_${userId}`, value: encrypt(String(historyId)) }, { onConflict: 'key' });
-             return res.status(204).send();
+            console.log(`No startHistoryId for team, setting it for the first time.`);
+            await supabase.from('secure_settings').upsert({ key: 'google_history_id_team', value: encrypt(String(historyId)) }, { onConflict: 'key' });
+            return res.status(204).send();
         }
 
-        const gmail = await getGmailClient(userId);
+        const gmail = await getGmailClient();
         const historyResponse = await gmail.users.history.list({
             userId: 'me',
             startHistoryId: startHistoryId,
@@ -332,14 +344,12 @@ app.post('/google/webhook', async (req, res) => {
             for (const item of history) {
                 if (item.messagesAdded) {
                     for (const msg of item.messagesAdded) {
-                        // Check if message is unread and not a sent message
                         if (msg.message.labelIds.includes('UNREAD') && !msg.message.labelIds.includes('SENT')) {
-                            const messageDetails = await gmail.users.messages.get({ userId: 'me', id: msg.id, format: 'raw' });
+                            const messageDetails = await gmail.users.messages.get({ userId: 'me', id: msg.message.id, format: 'raw' });
                             const rawEmail = Buffer.from(messageDetails.data.raw, 'base64').toString('utf-8');
                             
                             const parsed = await mailparser.simpleParser(rawEmail);
 
-                            // Find the original message this is a reply to
                             const inReplyTo = parsed.inReplyTo;
                             let pageId = null;
 
@@ -354,7 +364,6 @@ app.post('/google/webhook', async (req, res) => {
                                 }
                             }
 
-                            // Fallback: try to find page by sender email
                             if (!pageId && parsed.from.value && parsed.from.value.length > 0) {
                                 const senderEmail = parsed.from.value[0].address;
                                 const { data: page } = await supabase
@@ -387,7 +396,7 @@ app.post('/google/webhook', async (req, res) => {
         }
 
         // Update history ID
-        await supabase.from('secure_settings').upsert({ key: `google_history_id_${userId}`, value: encrypt(String(historyId)) }, { onConflict: 'key' });
+        await supabase.from('secure_settings').upsert({ key: 'google_history_id_team', value: encrypt(String(historyId)) }, { onConflict: 'key' });
 
         res.status(204).send();
     } catch (error) {
