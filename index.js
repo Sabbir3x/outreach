@@ -37,6 +37,8 @@ const oauth2Client = new google.auth.OAuth2(
     `${process.env.BACKEND_URL}/auth/google/callback`
 );
 
+console.log('Redirect URI being used:', oauth2Client._opts.redirectUri);
+
 // --- Helper Functions ---
 async function getGmailClient() {
     const { data } = await supabase.from('secure_settings').select('value').eq('key', 'google_refresh_token_team').single();
