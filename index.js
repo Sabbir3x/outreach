@@ -7,88 +7,65 @@ const bodyParser = require('body-parser');
 const { createClient } = require('@supabase/supabase-js');
 const cheerio = require('cheerio');
 const CryptoJS = require('crypto-js');
-const nodemailer = require('nodemailer');
+const { google } = require('googleapis');
 
-process.on('uncaughtException', (error, origin) => {
-    console.error('----- Uncaught exception -----');
-    console.error(error);
-    console.error('----- Origin -----');
-    console.error(origin);
-});
+// Global Error Handlers
+process.on('uncaughtException', (e, o) => { console.error('----- Uncaught exception -----', e, o); });
+process.on('unhandledRejection', (r, p) => { console.error('----- Unhandled Rejection -----', r, p); });
 
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('----- Unhandled Rejection at -----');
-    console.error(promise);
-    console.error('----- Reason -----');
-    console.error(reason);
-});
-
+// Encryption
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
-if (!ENCRYPTION_KEY) {
-    throw new Error("ENCRYPTION_KEY is not set in environment variables.");
-}
+if (!ENCRYPTION_KEY) throw new Error("ENCRYPTION_KEY is not set.");
+const encrypt = (text) => CryptoJS.AES.encrypt(text, ENCRYPTION_KEY).toString();
+const decrypt = (ciphertext) => CryptoJS.AES.decrypt(ciphertext, ENCRYPTION_KEY).toString(CryptoJS.enc.Utf8);
 
-// Helper functions for encryption and decryption
-const encrypt = (text) => {
-    return CryptoJS.AES.encrypt(text, ENCRYPTION_KEY).toString();
-};
-
-const decrypt = (ciphertext) => {
-    const bytes = CryptoJS.AES.decrypt(ciphertext, ENCRYPTION_KEY);
-    return bytes.toString(CryptoJS.enc.Utf8);
-};
-
-
+// Supabase
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+// Express App
 const app = express();
-const port = process.env.PORT || 3001;
-
+const port = process.env.PORT || 3002;
 app.use(cors());
-app.use(bodyParser.json({ limit: '5mb' }));
-app.use(bodyParser.urlencoded({ limit: '5mb', extended: true }));
+app.use(bodyParser.json());
 
-app.get('/test', (req, res) => {
-    console.log("Received request on /test endpoint");
-    res.status(200).json({ message: "Backend is alive and responding!" });
-});
+// Google OAuth2 Client
+const oauth2Client = new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    `${process.env.BACKEND_URL}/auth/google/callback`
+);
 
-// --- 1. SCRAPING FUNCTION ---
+// --- Helper Functions ---
+async function getGmailClient(userId) {
+    const { data } = await supabase.from('secure_settings').select('value').eq('key', `google_refresh_token_${userId}`).single();
+    if (!data || !data.value) throw new Error('Gmail not connected for this user.');
+    const refreshToken = decrypt(data.value);
+    oauth2Client.setCredentials({ refresh_token: refreshToken });
+    return google.gmail({ version: 'v1', auth: oauth2Client });
+}
+
 async function getPageContentAndMeta(url) {
-    console.log(`Fetching content via Bright Data Proxy for URL: ${url}`);
-    const connectionString = process.env.BRIGHTDATA_CONNECTION_STRING;
-    if (!connectionString || connectionString.includes("username:password")) throw new Error("BRIGHTDATA_CONNECTION_STRING is not set correctly.");
-
-    const [userPass, hostPort] = connectionString.split('@');
-    const [username, password] = userPass.split(':');
-    const [host, port] = hostPort.split(':');
-
     return new Promise((resolve, reject) => {
-        const options = { host, port: parseInt(port, 10), path: url, headers: { 'Proxy-Authorization': 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64'), 'Host': new URL(url).hostname } };
-        const request = http.get(options, (res) => {
+        const request = https.get(url, (res) => {
             let body = '';
             res.on('data', (chunk) => body += chunk);
             res.on('end', () => {
                 if (res.statusCode >= 200 && res.statusCode < 300) {
                     const $ = cheerio.load(body);
-
-                    // Simple regex to find email addresses
                     const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
                     const foundEmails = body.match(emailRegex);
                     const firstEmail = foundEmails ? foundEmails[0] : null;
-
                     const metadata = {
-                        title: $('meta[property="og:title"]').attr('content') || $('title').text(),
-                        description: $('meta[property="og:description"]').attr('content') || $('meta[name="description"]').attr('content') || '',
+                        title: $('title').text(),
+                        description: $('meta[name="description"]').attr('content') || '',
                         imageUrl: $('meta[property="og:image"]').attr('content') || '',
                         contactEmail: firstEmail,
                     };
-                    console.log("Extracted Metadata:", metadata);
                     resolve({ html: body, metadata });
                 } else {
-                    reject(new Error(`Request failed: ${res.statusCode} ${body}`))
+                    reject(new Error(`Request failed with status ${res.statusCode}`));
                 }
             });
         });
@@ -99,53 +76,32 @@ async function getPageContentAndMeta(url) {
 
 const ANALYSIS_PROMPT = `Act as a senior design consultant for \"Minimind Agency\", a creative agency specializing in branding, marketing, and web design. Your tone is professional, friendly, and helpful. You are analyzing the following HTML content from a business's Facebook page. Analyze the HTML and text for branding, marketing, and technical issues from a design agency's perspective. Specifically look for: 1.  **Branding & Content:** Is there a clear 'About Us' section? Is the language professional? Are there spelling/grammar errors? Is there a consistent brand message? 2.  **Marketing & CTA:** Is there a clear Call-to-Action (e.g., \"Send Message\", \"Shop Now\")? Is contact information (email, phone) easily found? 3.  **Technical SEO:** Are important meta tags for sharing (like og:title, og:description, og:image) present in the HTML <head>? Is there a link to an external website? Is it mobile-friendly (look for viewport meta tag)? Based on your analysis, you MUST return ONLY a single, minified JSON object. Do not include any text or formatting before or after the JSON object. The JSON object must have the following structure: {\"overall_score\": <an integer score from 0-100 based on the severity and number of issues found>},\"issues\": [ { \"type\": \"Branding\" | \"Marketing\" | \"Content Quality\" | \"Technical SEO\", \"severity\": \"High\" | \"Medium\" | \"Low\", \"description\": \"A concise description of a specific issue found.\" } ],\"suggestions\": [ { \"title\": \"A short, catchy title for a proposal point.\", \"description\": \"A one-sentence description of a service Minimind Agency can offer to fix an issue. Frame it as a solution.\" } ],\"rationale\": \"A 1-2 sentence, human-readable explanation for the score and decision, from the perspective of the AI agent.\" }`;
 
-// --- 2. DYNAMIC AI ANALYSIS FUNCTION ---
 function createApiRequest(provider, apiKey, promptContent, type = 'analyze') {
-    let prompt, response_format, model;
+    let prompt;
+    let response_format = { "type": "text" };
+    if (type === 'analyze' || type === 'proposal') {
+        response_format = { "type": "json_object" };
+    }
     if (type === 'analyze') {
         prompt = ANALYSIS_PROMPT + ` Here is the HTML content for page ${promptContent.pageName}: --- ${promptContent.content.substring(0, 30000)} ---`;
-        response_format = { "type": "json_object" };
     } else {
         prompt = promptContent;
-        response_format = { "type": "text" };
     }
+    if (!prompt) throw new Error("Prompt could not be generated for the AI request.");
 
     let url, postData, headers;
-
     switch (provider) {
-        case 'openai':
-            url = 'https://api.openai.com/v1/chat/completions';
-            headers = { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
-            model = "gpt-3.5-turbo";
-            postData = JSON.stringify({ model, response_format, messages: [{ role: "system", content: "You are a helpful assistant." }, { role: "user", content: prompt }] });
-            break;
         case 'gemini':
             url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
             headers = { 'Content-Type': 'application/json' };
-            if (type === 'analyze' || type === 'proposal') {
-                postData = JSON.stringify({ 
-                    contents: [{ parts: [{ text: prompt }] }],
-                    generationConfig: {
-                        response_mime_type: "application/json",
-                    }
-                });
-            } else {
-                postData = JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] });
+            let geminiPayload = { contents: [{ parts: [{ text: prompt }] }] };
+            if (response_format.type === 'json_object') {
+                geminiPayload.generationConfig = { response_mime_type: "application/json" };
             }
+            postData = JSON.stringify(geminiPayload);
             break;
-        case 'deepseek':
-            url = 'https://api.deepseek.com/v1/chat/completions';
-            headers = { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
-            model = "deepseek-chat";
-            postData = JSON.stringify({ model, response_format, messages: [{ role: "system", content: "You are a helpful assistant." }, { role: "user", content: prompt }] });
-            break;
-        case 'claude':
-            url = 'https://api.anthropic.com/v1/messages';
-            headers = { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'Content-Type': 'application/json' };
-            model = "claude-3-sonnet-20240229";
-            postData = JSON.stringify({ model, max_tokens: 1024, messages: [{ role: "user", content: prompt }] });
-            break;
-        default: throw new Error('Invalid provider');
+        default:
+            throw new Error('Invalid provider');
     }
 
     return new Promise((resolve, reject) => {
@@ -156,13 +112,9 @@ function createApiRequest(provider, apiKey, promptContent, type = 'analyze') {
                 try {
                     if (res.statusCode < 200 || res.statusCode >= 300) return reject(new Error(`${provider} API failed with status ${res.statusCode}: ${body}`));
                     const responseData = JSON.parse(body);
-                    let rawJson;
-                    if (provider === 'claude') rawJson = responseData.content[0].text;
-                    else if (provider === 'gemini') rawJson = responseData.candidates[0].content.parts[0].text;
-                    else rawJson = responseData.choices[0].message.content;
-                    
-                    if (type === 'analyze') {
-                        const jsonMatch = rawJson.match(/\{.*\}/s);
+                    const rawJson = responseData.candidates[0].content.parts[0].text;
+                    if (response_format.type === 'json_object') {
+                         const jsonMatch = rawJson.match(/\{.*\}/s);
                         if (!jsonMatch) throw new Error("AI returned non-JSON response.");
                         resolve(JSON.parse(jsonMatch[0]));
                     } else {
@@ -173,460 +125,274 @@ function createApiRequest(provider, apiKey, promptContent, type = 'analyze') {
                 }
             });
         });
-        req.on('timeout', () => { req.abort(); reject(new Error(`${provider} API request timed out.`)); });
         req.on('error', (e) => reject(e));
         req.write(postData);
         req.end();
     });
 }
 
-// --- 3. MAIN API ENDPOINTS ---
-app.post('/analyze', async (req, res) => {
-    const { pageUrl, pageName } = req.body;
-    if (!pageUrl || !pageName) return res.status(400).json({ error: 'pageUrl and pageName are required.' });
+// --- Endpoints ---
+app.get('/test', (req, res) => res.status(200).json({ message: "Backend is alive!" }));
 
+// Auth
+app.get('/auth/google', (req, res) => {
+    const { userId } = req.query;
+    const url = oauth2Client.generateAuthUrl({ access_type: 'offline', prompt: 'consent', scope: ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.send', 'https://www.googleapis.com/auth/gmail.modify'], state: userId });
+    res.redirect(url);
+});
+app.get('/auth/google/callback', async (req, res) => {
+    const { code, state: userId } = req.query;
     try {
+        const { tokens } = await oauth2Client.getToken(code);
+        if (!tokens.refresh_token) throw new Error("Refresh token not received.");
+        oauth2Client.setCredentials(tokens);
+        const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+        const profile = await gmail.users.getProfile({ userId: 'me' });
+        await supabase.from('secure_settings').upsert([
+            { key: `google_refresh_token_${userId}`, value: encrypt(tokens.refresh_token) },
+            { key: `google_user_email_${userId}`, value: profile.data.emailAddress }
+        ], { onConflict: 'key' });
+        res.redirect(`${process.env.FRONTEND_URL}?view=settings&status=google_connected`);
+    } catch (error) {
+        console.error("Error getting Google token:", error);
+        res.redirect(`${process.env.FRONTEND_URL}?view=settings&status=google_failed`);
+    }
+});
+app.get('/auth/google/status', async (req, res) => {
+    const { userId } = req.query;
+    const { data } = await supabase.from('secure_settings').select('value').eq('key', `google_user_email_${userId}`).single();
+    if (data && data.value) res.json({ connected: true, email: data.value });
+    else res.json({ connected: false });
+});
+app.post('/auth/google/disconnect', async (req, res) => {
+    const { userId } = req.body;
+    await supabase.from('secure_settings').delete().like('key', `%_${userId}`);
+    res.json({ message: "Disconnected successfully" });
+});
+
+app.post('/auth/google/watch', async (req, res) => {
+    const { userId } = req.body;
+    try {
+        const gmail = await getGmailClient(userId);
+        const response = await gmail.users.watch({
+            userId: 'me',
+            requestBody: {
+                topicName: process.env.GOOGLE_PUB_SUB_TOPIC,
+                labelIds: ['INBOX']
+            }
+        });
+        res.status(200).json(response.data);
+    } catch (error) {
+        console.error('Error setting up Gmail watch:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Analyze
+app.post('/analyze', async (req, res) => {
+    try {
+        const { pageUrl, pageName } = req.body;
         const { html: htmlContent, metadata } = await getPageContentAndMeta(pageUrl);
         const provider = process.env.API_PROVIDER?.toLowerCase();
         const apiKey = process.env[`${provider.toUpperCase()}_API_KEY`];
-        if (!apiKey || apiKey.includes('Your-')) throw new Error(`API key for '${provider}' is not set correctly.`);
-
-        console.log(`Using AI Provider: ${provider} for analysis`);
-        const analysisResult = await createApiRequest(provider, apiKey, { content: htmlContent, pageName: pageName }, 'analyze');
-        
+        const analysisResult = await createApiRequest(provider, apiKey, { content: htmlContent, pageName }, 'analyze');
         res.status(200).json({ ...analysisResult, metadata });
-
     } catch (error) {
-        console.error("Error in /analyze endpoint:", error.message);
         res.status(500).json({ error: error.message });
     }
 });
 
-app.post('/chat', async (req, res) => {
-    const { prompt } = req.body;
-    if (!prompt) return res.status(400).json({ error: 'prompt is required.' });
-
-    try {
-        const provider = process.env.API_PROVIDER?.toLowerCase();
-        const apiKey = process.env[`${provider.toUpperCase()}_API_KEY`];
-        if (!apiKey || apiKey.includes('Your-')) throw new Error(`API key for '${provider}' is not set.`);
-
-        console.log(`Using AI Provider: ${provider} for chat`);
-        const chatResult = await createApiRequest(provider, apiKey, prompt, 'chat');
-        res.status(200).json({ reply: chatResult });
-
-    } catch (error) {
-        console.error("Error in /chat endpoint:", error.message);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-const PROPOSAL_PROMPT_TEMPLATE = `
-Act as a friendly and professional design consultant from "Minimind Agency". Your goal is to write a personalized and compelling outreach message based on an analysis of a potential client's Facebook page.
-
-**Analysis Details:**
-- Page Name: {pageName}
-- Overall Design Score: {overall_score}/100
-- Key Issues Found: {issues}
-- AI Rationale: {rationale}
-
-**Your Task:**
-Generate two versions of an outreach message: a short, friendly Facebook message and a slightly more detailed professional email. The tone should be helpful, not spammy. Reference one or two key issues from the analysis as a conversation starter.
-
-**Output Format:**
-You MUST return ONLY a single, minified JSON object with the following structure: {"facebook_message": "<Your generated Facebook message>", "email_subject": "<Your generated email subject>", "email_body": "<Your generated email body>"}
-
-**Example Snippets (for tone and style):
-- Facebook: "Hi {pageName}, I checked your page and noticed some design inconsistencies that might be affecting engagement. I can share a free concept for you to review — no obligations. Interested?"
-- Email Subject: "Design refresh proposal for {pageName}"
-- Email Body: "Hello, I’m from Minimind Agency. We reviewed your Facebook page and see opportunities to improve clarity through consistent branding..."
-
-Now, generate the JSON for the page mentioned above.
-`;
-
+// Drafts & Proposals
 app.post('/create-proposal', async (req, res) => {
     const { analysisId, userId } = req.body;
-    if (!analysisId || !userId) return res.status(400).json({ error: 'analysisId and userId are required.' });
-
     try {
-        // 1. Fetch analysis and page data from Supabase
-        const { data: analysis, error: analysisError } = await supabase
-            .from('analyses')
-            .select(`
-                *,
-                pages (*)
-            `)
-            .eq('id', analysisId)
-            .single();
-
-        if (analysisError) throw new Error(`Failed to fetch analysis: ${analysisError.message}`);
-        if (!analysis) return res.status(404).json({ error: 'Analysis not found.' });
-
+        const { data: analysis } = await supabase.from('analyses').select(`*, pages (*)`).eq('id', analysisId).single();
+        if (!analysis) throw new Error("Analysis not found");
         const page = analysis.pages;
-
-        // 2. Construct the prompt for the AI
-        let prompt = PROPOSAL_PROMPT_TEMPLATE
-            .replace('{pageName}', page.name)
-            .replace('{overall_score}', analysis.overall_score)
-            .replace('{issues}', JSON.stringify(analysis.issues.map(i => i.description)))
-            .replace('{rationale}', analysis.rationale);
-
-        // 3. Call the AI to generate the proposal
+        let prompt = ANALYSIS_PROMPT.replace('{pageName}', page.name).replace('{overall_score}', analysis.overall_score).replace('{issues}', JSON.stringify(analysis.issues.map(i => i.description))).replace('{rationale}', analysis.rationale);
         const provider = process.env.API_PROVIDER?.toLowerCase();
         const apiKey = process.env[`${provider.toUpperCase()}_API_KEY`];
-        const aiResultRaw = await createApiRequest(provider, apiKey, prompt, 'proposal');
-        
-        const jsonMatch = aiResultRaw.match(/\{.*\}/s);
-        if (!jsonMatch) throw new Error("AI returned non-JSON response for proposal.");
-        const proposalContent = JSON.parse(jsonMatch[0]);
-
-        // 4. Save the new draft to the database
-        const { data: newDraft, error: draftError } = await supabase
-            .from('drafts')
-            .insert({
-                page_id: page.id,
-                analysis_id: analysis.id,
-                created_by: userId,
-                fb_message: proposalContent.facebook_message,
-                email_subject: proposalContent.email_subject,
-                email_body: proposalContent.email_body,
-                status: 'pending'
-            })
-            .select()
-            .single();
-
-        if (draftError) throw new Error(`Failed to save draft: ${draftError.message}`);
-
+        const aiResult = await createApiRequest(provider, apiKey, prompt, 'proposal');
+        const { data: newDraft } = await supabase.from('drafts').insert({ page_id: page.id, analysis_id: analysis.id, created_by: userId, fb_message: aiResult.facebook_message, email_subject: aiResult.email_subject, email_body: aiResult.email_body, status: 'pending' }).select().single();
         res.status(201).json(newDraft);
-
     } catch (error) {
-        console.error("Error in /create-proposal endpoint:", error.message);
         res.status(500).json({ error: error.message });
     }
 });
-
-const SEND_INTERVAL_MS = 10000; // 10 seconds between each message
-
-app.post('/campaigns/:id/send-all', async (req, res) => {
-    const { id: campaignId } = req.params;
-    const { userId, channel } = req.body; // channel can be 'email', 'facebook', or 'both'
-
-    if (!userId || !channel) return res.status(400).json({ error: 'userId and channel are required.' });
-
-    res.status(202).json({ message: "Bulk send process started. Messages will be sent in the background." });
-
-    // Run the sending process in the background
-    (async () => {
-        try {
-            console.log(`Starting bulk send for campaign: ${campaignId} with channel: ${channel}`);
-
-            // First, check if the campaign is active
-            const { data: campaign, error: campaignError } = await supabase
-                .from('campaigns')
-                .select('status')
-                .eq('id', campaignId)
-                .single();
-
-            if (campaignError) throw new Error(`Failed to fetch campaign status: ${campaignError.message}`);
-            if (campaign.status !== 'active') {
-                console.log(`Campaign ${campaignId} is not active. Aborting bulk send.`);
-                return;
-            }
-            console.log("Step 1: Campaign status confirmed as active.");
-
-            const { data: drafts, error: draftsError } = await supabase
-                .from('drafts')
-                .select('*, pages(*)') // Fetch all page data
-                .eq('campaign_id', campaignId)
-                .eq('status', 'approved');
-
-            if (draftsError) throw new Error(`Failed to fetch approved drafts: ${draftsError.message}`);
-            
-            if (!drafts || drafts.length === 0) {
-                console.log("No approved drafts found to send for this campaign.");
-                return;
-            }
-            console.log(`Step 2: Found ${drafts.length} approved drafts.`);
-
-            // Fetch SMTP settings once for the campaign
-            const { data: settingsData, error: settingsError } = await supabase
-                .from('secure_settings')
-                .select('key, value')
-                .in('key', ['smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass']);
-            
-            if (settingsError) {
-                console.error("Error fetching SMTP settings:", settingsError.message);
-                return; // Stop execution if settings can't be fetched
-            }
-            console.log("Step 3: Fetched secure settings from DB.");
-
-            const smtpConfig = settingsData ? settingsData.reduce((acc, setting) => {
-                acc[setting.key] = setting.value;
-                return acc;
-            }, {}) : {};
-
-            if (!smtpConfig.smtp_pass) {
-                console.warn("SMTP password is not configured in secure_settings. Aborting email send.");
-                return;
-            }
-            console.log("Step 4: SMTP config constructed.");
-
-            const decryptedPass = decrypt(smtpConfig.smtp_pass);
-            console.log("Step 5: SMTP password decrypted.");
-
-            const transporter = nodemailer.createTransport({
-                host: smtpConfig.smtp_host,
-                port: parseInt(smtpConfig.smtp_port, 10),
-                secure: true, // true for 465
-                auth: { user: smtpConfig.smtp_user, pass: decryptedPass },
-                tls: {
-                    ciphers:'SSLv3'
-                },
-                requireTLS: true,
-            });
-            console.log("Step 6: Nodemailer transporter created.");
-
-            for (const draft of drafts) {
-                let sent = false;
-                if ((channel === 'email' || channel === 'both') && draft.send_to_email && smtpConfig.smtp_pass) {
-                    try {
-                        const decryptedPass = decrypt(smtpConfig.smtp_pass);
-                        const transporter = nodemailer.createTransport({
-                            host: smtpConfig.smtp_host,
-                            port: parseInt(smtpConfig.smtp_port, 10),
-                            secure: true, // true for 465
-                            auth: { user: smtpConfig.smtp_user, pass: decryptedPass },
-                        });
-
-                        console.log(`Sending email for draft ${draft.id} to ${draft.pages.contact_email}...`);
-                        await transporter.sendMail({
-                            from: `"Minimind Agency" <${smtpConfig.smtp_user}>`,
-                            to: draft.pages.contact_email,
-                            subject: draft.email_subject,
-                            html: draft.email_body,
-                        });
-                        sent = true;
-                        console.log(`Email sent for draft ${draft.id}`);
-                    } catch (emailError) {
-                        console.error(`Failed to send email for draft ${draft.id}:`, emailError.message);
-                    }
-                }
-
-                if ((channel === 'facebook' || channel === 'both') && draft.send_to_facebook) {
-                    // TODO: Add Facebook sending logic here
-                    console.log(`Simulating Facebook message send for draft ${draft.id}`);
-                    sent = true; // Mark as sent for simulation purposes
-                }
-
-                if (sent) {
-                    const { error: updateError } = await supabase
-                        .from('drafts')
-                        .update({ status: 'sent', sent_at: new Date().toISOString() })
-                        .eq('id', draft.id);
-                    if (updateError) console.error(`Failed to update status for draft ${draft.id}:`, updateError.message);
-                } else {
-                    console.warn(`Draft ${draft.id} was not sent to any channel.`);
-                }
-
-                await new Promise(resolve => setTimeout(resolve, SEND_INTERVAL_MS));
-            }
-            console.log(`Bulk send finished for campaign: ${campaignId}`);
-        } catch (error) {
-            console.error(`Error during bulk send for campaign ${campaignId}:`, error.message);
-        }
-    })();
-});
-
-app.post('/settings/smtp', async (req, res) => {
-    const { userId, host, port, user, pass } = req.body;
-    if (!userId || !host || !port || !user || !pass) {
-        return res.status(400).json({ error: 'Missing required SMTP settings.' });
-    }
-
-    try {
-        const settingsToUpsert = [
-            { key: 'smtp_host', value: host, updated_by: userId },
-            { key: 'smtp_port', value: port.toString(), updated_by: userId },
-            { key: 'smtp_user', value: user, updated_by: userId },
-            { key: 'smtp_pass', value: encrypt(pass), updated_by: userId }, // Encrypt the password
-        ];
-
-        const { error } = await supabase.from('secure_settings').upsert(settingsToUpsert, { onConflict: 'key' });
-
-        if (error) throw new Error(`Failed to save SMTP settings: ${error.message}`);
-
-        res.status(200).json({ message: 'SMTP settings saved successfully.' });
-
-    } catch (error) {
-        console.error("Error saving SMTP settings:", error.message);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.get('/settings/smtp', async (req, res) => {
-    try {
-        const { data, error } = await supabase
-            .from('secure_settings')
-            .select('key, value')
-            .in('key', ['smtp_host', 'smtp_user']);
-
-        if (error) throw error;
-
-        const settings = data.reduce((acc, setting) => {
-            acc[setting.key] = setting.value;
-            return acc;
-        }, {});
-
-        res.status(200).json(settings);
-    } catch (error) {
-        console.error("Error fetching SMTP status:", error.message);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.delete('/settings/smtp', async (req, res) => {
-    try {
-        const { error } = await supabase
-            .from('secure_settings')
-            .delete()
-            .in('key', ['smtp_host', 'smtp_port', 'smtp_user', 'smtp_pass']);
-
-        if (error) throw new Error(`Failed to delete SMTP settings: ${error.message}`);
-
-        res.status(200).json({ message: 'SMTP settings deleted successfully.' });
-    } catch (error) {
-        console.error("Error deleting SMTP settings:", error.message);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// --- Facebook Settings Endpoints ---
-app.get('/settings/facebook', async (req, res) => {
-    try {
-        const { data, error } = await supabase
-            .from('secure_settings')
-            .select('key, value')
-            .in('key', ['facebook_page_id', 'facebook_page_name']);
-
-        if (error) throw error;
-
-        const settings = data.reduce((acc, setting) => {
-            acc[setting.key] = setting.value;
-            return acc;
-        }, {});
-
-        res.status(200).json(settings);
-    } catch (error) {
-        console.error("Error fetching Facebook status:", error.message);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.post('/settings/facebook/connect', async (req, res) => {
-    const { userId, accessToken, pageId, pageName } = req.body;
-    if (!userId || !accessToken || !pageId || !pageName) {
-        return res.status(400).json({ error: 'Missing required Facebook connection data.' });
-    }
-
-    try {
-        // In a real app, you would exchange the short-lived accessToken for a long-lived one here.
-        // For now, we'll just save the provided one (assuming it's already long-lived or handled by frontend).
-        const settingsToUpsert = [
-            { key: 'facebook_page_id', value: pageId, updated_by: userId },
-            { key: 'facebook_page_name', value: pageName, updated_by: userId },
-            { key: 'facebook_page_access_token', value: encrypt(accessToken), updated_by: userId },
-        ];
-
-        const { error } = await supabase.from('secure_settings').upsert(settingsToUpsert, { onConflict: 'key' });
-
-        if (error) throw new Error(`Failed to save Facebook settings: ${error.message}`);
-
-        res.status(200).json({ message: 'Facebook page connected successfully.' });
-
-    } catch (error) {
-        console.error("Error connecting Facebook page:", error.message);
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.delete('/settings/facebook', async (req, res) => {
-    try {
-        const { error } = await supabase
-            .from('secure_settings')
-            .delete()
-            .in('key', ['facebook_page_id', 'facebook_page_name', 'facebook_page_access_token']);
-
-        if (error) throw new Error(`Failed to delete Facebook settings: ${error.message}`);
-
-        res.status(200).json({ message: 'Facebook settings deleted successfully.' });
-    } catch (error) {
-        console.error("Error deleting Facebook settings:", error.message);
-        res.status(500).json({ error: error.message });
-    }
-});
-
 app.post('/drafts/custom', async (req, res) => {
-    const { 
-        userId, mode, pageName, pageUrl, contactEmail, 
-        aiNotes, fbMessage, emailSubject, emailBody 
-    } = req.body;
-
-    if (!userId || !pageName || !pageUrl) {
-        return res.status(400).json({ error: 'User, Page Name, and Page URL are required.' });
-    }
-
+    const { userId, mode, pageName, pageUrl, contactEmail, aiNotes, fbMessage, emailSubject, emailBody } = req.body;
     try {
-        // 1. Upsert the page
-        const { data: page, error: pageError } = await supabase
-            .from('pages')
-            .upsert({ url: pageUrl, name: pageName, contact_email: contactEmail, created_by: userId }, { onConflict: 'url' })
-            .select()
-            .single();
-
-        if (pageError) throw new Error(`Failed to upsert page: ${pageError.message}`);
-
-        let finalFbMessage = fbMessage;
-        let finalEmailSubject = emailSubject;
-        let finalEmailBody = emailBody;
-
-        // 2. If AI mode, generate content
+        const { data: page } = await supabase.from('pages').upsert({ url: pageUrl, name: pageName, contact_email: contactEmail, created_by: userId }, { onConflict: 'url' }).select().single();
+        if (!page) throw new Error("Failed to upsert page");
+        let finalFbMessage = fbMessage, finalEmailSubject = emailSubject, finalEmailBody = emailBody;
         if (mode === 'ai') {
             const aiPrompt = `Act as a design consultant. Based on these notes: "${aiNotes}", write a short Facebook message and a professional email proposal for the page "${pageName}". Return ONLY a minified JSON object: {"facebook_message": "...", "email_subject": "...", "email_body": "..."}`;
-            
             const provider = process.env.API_PROVIDER?.toLowerCase();
             const apiKey = process.env[`${provider.toUpperCase()}_API_KEY`];
-            const aiResultRaw = await createApiRequest(provider, apiKey, aiPrompt, 'proposal');
-            
-            const jsonMatch = aiResultRaw.match(/\{.*\}/s);
-            if (!jsonMatch) throw new Error("AI returned non-JSON response.");
-            const proposalContent = JSON.parse(jsonMatch[0]);
+            const aiResult = await createApiRequest(provider, apiKey, aiPrompt, 'proposal');
+            finalFbMessage = aiResult.facebook_message;
+            finalEmailSubject = aiResult.email_subject;
+            finalEmailBody = aiResult.email_body;
+        }
+        const { data: newDraft } = await supabase.from('drafts').insert({ page_id: page.id, created_by: userId, fb_message: finalFbMessage, email_subject: finalEmailSubject, email_body: finalEmailBody, status: 'pending' }).select().single();
+        res.status(201).json(newDraft);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+app.post('/drafts/:id/send', async (req, res) => {
+    const { id: draftId } = req.params;
+    const { userId } = req.body;
+    try {
+        const gmail = await getGmailClient(userId);
+        const { data: draft } = await supabase.from('drafts').select('*, pages(*)').eq('id', draftId).single();
+        if (!draft) throw new Error("Draft not found.");
+        let messageId = null;
+        if (draft.send_to_email) {
+            const emailLines = [`To: ${draft.pages.contact_email}`, `Subject: ${draft.email_subject}`, 'Content-type: text/html;charset=iso-8859-1', 'MIME-Version: 1.0', '', draft.email_body.replace(/\n/g, '<br>')];
+            const rawEmail = Buffer.from(emailLines.join('\r\n')).toString('base64');
+            const sentEmail = await gmail.users.messages.send({ userId: 'me', requestBody: { raw: rawEmail } });
+            messageId = sentEmail.data.id;
+        }
+        // TODO: Facebook send logic
+        await supabase.from('messages').insert({ draft_id: draft.id, page_id: draft.page_id, platform: 'email', status: 'sent', sent_by: userId, provider_message_id: messageId });
+        await supabase.rpc('update_draft_status_as_service_role', { draft_id_in: draft.id, new_status: 'sent' });
+        res.status(200).json({ message: "Message sent successfully." });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
 
-            finalFbMessage = proposalContent.facebook_message;
-            finalEmailSubject = proposalContent.email_subject;
-            finalEmailBody = proposalContent.email_body;
+// Campaigns
+app.post('/campaigns/:id/send-all', async (req, res) => { /* ... */ });
+
+// Conversations
+app.post('/replies/send', async (req, res) => { /* ... */ });
+app.delete('/conversations/:pageId', async (req, res) => { /* ... */ });
+
+const mailparser = require('mailparser');
+
+// ... (keep existing code until the webhook)
+
+// Google Webhook for replies
+app.post('/google/webhook', async (req, res) => {
+    console.log('Received Google Webhook Notification:');
+    try {
+        const message = req.body.message;
+        if (!message || !message.data) {
+            console.log('Invalid webhook payload');
+            return res.status(400).send('Invalid payload');
         }
 
-        // 3. Save the new draft
-        const { data: newDraft, error: draftError } = await supabase
-            .from('drafts')
-            .insert({
-                page_id: page.id,
-                created_by: userId,
-                fb_message: finalFbMessage,
-                email_subject: finalEmailSubject,
-                email_body: finalEmailBody,
-                status: 'pending'
-            })
-            .select()
+        const decodedData = Buffer.from(message.data, 'base64').toString('utf-8');
+        const data = JSON.parse(decodedData);
+        const { emailAddress, historyId } = data;
+
+        console.log(`Processing notification for ${emailAddress} with historyId ${historyId}`);
+
+        // Find user by email
+        const { data: userSetting, error: userError } = await supabase
+            .from('secure_settings')
+            .select('key')
+            .eq('value', emailAddress)
+            .like('key', 'google_user_email_%')
             .single();
 
-        if (draftError) throw new Error(`Failed to save draft: ${draftError.message}`);
+        if (userError || !userSetting) {
+            console.error(`Could not find user for email: ${emailAddress}`);
+            return res.status(404).send('User not found');
+        }
 
-        res.status(201).json(newDraft);
+        const userId = userSetting.key.split('_').pop();
 
+        // Get last history ID
+        const { data: historySetting } = await supabase
+            .from('secure_settings')
+            .select('value')
+            .eq('key', `google_history_id_${userId}`)
+            .single();
+
+        const startHistoryId = historySetting ? decrypt(historySetting.value) : null;
+        if (!startHistoryId) {
+            console.log(`No startHistoryId for user ${userId}, will process all messages and set it.`);
+            // If no historyId, we should probably fetch all messages and set it.
+            // For now, we'll just log and update to the new historyId to avoid processing all emails on first notification.
+             await supabase.from('secure_settings').upsert({ key: `google_history_id_${userId}`, value: encrypt(String(historyId)) }, { onConflict: 'key' });
+             return res.status(204).send();
+        }
+
+        const gmail = await getGmailClient(userId);
+        const historyResponse = await gmail.users.history.list({
+            userId: 'me',
+            startHistoryId: startHistoryId,
+        });
+
+        const history = historyResponse.data.history;
+        if (history && history.length > 0) {
+            for (const item of history) {
+                if (item.messagesAdded) {
+                    for (const msg of item.messagesAdded) {
+                        // Check if message is unread and not a sent message
+                        if (msg.message.labelIds.includes('UNREAD') && !msg.message.labelIds.includes('SENT')) {
+                            const messageDetails = await gmail.users.messages.get({ userId: 'me', id: msg.id, format: 'raw' });
+                            const rawEmail = Buffer.from(messageDetails.data.raw, 'base64').toString('utf-8');
+                            
+                            const parsed = await mailparser.simpleParser(rawEmail);
+
+                            // Find the original message this is a reply to
+                            const inReplyTo = parsed.inReplyTo;
+                            let pageId = null;
+
+                            if (inReplyTo) {
+                                const { data: originalMessage } = await supabase
+                                    .from('messages')
+                                    .select('page_id')
+                                    .eq('provider_message_id', inReplyTo.replace(/[<>]/g, ''))
+                                    .single();
+                                if (originalMessage) {
+                                    pageId = originalMessage.page_id;
+                                }
+                            }
+
+                            // Fallback: try to find page by sender email
+                            if (!pageId && parsed.from.value && parsed.from.value.length > 0) {
+                                const senderEmail = parsed.from.value[0].address;
+                                const { data: page } = await supabase
+                                    .from('pages')
+                                    .select('id')
+                                    .eq('contact_email', senderEmail)
+                                    .single();
+                                if (page) {
+                                    pageId = page.id;
+                                }
+                            }
+
+                            if (pageId) {
+                                await supabase.from('replies').insert({
+                                    content: parsed.text,
+                                    platform: 'email',
+                                    received_at: parsed.date,
+                                    is_reply: false, // This is an incoming message
+                                    page_id: pageId,
+                                    sender: parsed.from.text,
+                                });
+                                console.log(`Processed and stored new message: ${parsed.subject}`);
+                            } else {
+                                console.log(`Could not determine page_id for message: ${parsed.subject}`);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Update history ID
+        await supabase.from('secure_settings').upsert({ key: `google_history_id_${userId}`, value: encrypt(String(historyId)) }, { onConflict: 'key' });
+
+        res.status(204).send();
     } catch (error) {
-        console.error("Error in /drafts/custom endpoint:", error.message);
-        res.status(500).json({ error: error.message });
+        console.error('Error processing webhook:', error);
+        res.status(500).send('Error processing webhook');
     }
 });
 
